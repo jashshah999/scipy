@@ -1,4 +1,5 @@
 import pickle
+import warnings
 from itertools import product
 
 import pytest
@@ -1529,3 +1530,188 @@ def test_non_writeable():
     mat = np.eye(4)
     mat.flags.writeable = False
     RigidTransform.from_matrix(mat)  # Regression test against gh-24378
+
+
+def _weighted_procrustes_reference(a, b, w):
+    """Independent weighted Kabsch-Umeyama solution (rotation, translation)."""
+    w = w / w.sum()
+    a_mean, b_mean = w @ a, w @ b
+    H = (b - b_mean).T @ (w[:, None] * (a - a_mean))
+    U, _, Vt = np.linalg.svd(H)
+    D = np.diag([1.0, 1.0, np.sign(np.linalg.det(Vt.T @ U.T))])
+    C = Vt.T @ D @ U.T
+    return C, a_mean - C @ b_mean
+
+
+@make_xp_test_case((RigidTransform, "align_points"), (RigidTransform, "apply"))
+def test_align_points_no_noise(xp):
+    dtype = xpx.default_dtype(xp)
+    atol = 1e-10 if dtype == xp.float64 else 1e-4
+    rng = np.random.default_rng(0)
+    tf_true = rigid_transform_to_xp(
+        RigidTransform.from_components(
+            rng.normal(size=3) * 10, Rotation.random(rng=rng)
+        ),
+        xp,
+    )
+    b = xp.asarray(rng.normal(size=(20, 3)), dtype=dtype)
+    a = tf_true.apply(b)
+
+    tf, rssd = RigidTransform.align_points(a, b)
+    assert tf.single
+    xp_assert_close(tf.as_matrix(), tf_true.as_matrix(), atol=atol)
+    xp_assert_close(tf.apply(b), a, atol=atol)
+    rssd_atol = 1e-6 if dtype == xp.float64 else 1e-2
+    xp_assert_close(rssd, xp.asarray(0.0, dtype=dtype)[()], atol=rssd_atol)
+
+
+@make_xp_test_case((RigidTransform, "align_points"), (RigidTransform, "apply"))
+def test_align_points_noise_matches_reference(xp):
+    dtype = xpx.default_dtype(xp)
+    atol = 1e-10 if dtype == xp.float64 else 1e-4
+    rng = np.random.default_rng(1)
+    b = rng.normal(size=(30, 3))
+    tf_true = RigidTransform.from_components(
+        rng.normal(size=3), Rotation.random(rng=rng)
+    )
+    a = tf_true.apply(b) + 0.05 * rng.normal(size=b.shape)
+    w = rng.uniform(0.1, 2.0, size=30)
+
+    C, t = _weighted_procrustes_reference(a, b, w)
+    tf, rssd = RigidTransform.align_points(
+        xp.asarray(a, dtype=dtype),
+        xp.asarray(b, dtype=dtype),
+        xp.asarray(w, dtype=dtype),
+    )
+    expected = np.eye(4)
+    expected[:3, :3], expected[:3, 3] = C, t
+    xp_assert_close(tf.as_matrix(), xp.asarray(expected, dtype=dtype), atol=atol)
+
+    residual = a - (b @ C.T + t)
+    expected_rssd = np.sqrt(np.sum(w * np.sum(residual**2, axis=1)))
+    rtol = 1e-6 if dtype == xp.float64 else 1e-3
+    xp_assert_close(rssd, xp.asarray(expected_rssd, dtype=dtype)[()], rtol=rtol)
+
+
+@make_xp_test_case((RigidTransform, "align_points"), (RigidTransform, "apply"))
+def test_align_points_is_optimal(xp):
+    # Any perturbation of the returned transform increases the weighted loss.
+    rng = np.random.default_rng(2)
+    b = rng.normal(size=(15, 3))
+    a = rng.normal(size=(15, 3))
+    w = rng.uniform(0.5, 1.5, size=15)
+    dtype = xpx.default_dtype(xp)
+    tf, _ = RigidTransform.align_points(
+        xp.asarray(a, dtype=dtype),
+        xp.asarray(b, dtype=dtype),
+        xp.asarray(w, dtype=dtype),
+    )
+    tf = RigidTransform.from_matrix(np.asarray(tf.as_matrix(), dtype=np.float64))
+
+    def loss(t):
+        return np.sum(w * np.sum((a - t.apply(b))**2, axis=1))
+
+    best = loss(tf)
+    eps = 1e-3 if dtype == xp.float64 else 1e-1
+    for _ in range(50):
+        delta = RigidTransform.from_exp_coords(eps * rng.normal(size=6))
+        assert loss(delta * tf) > best
+
+
+@make_xp_test_case((RigidTransform, "align_points"))
+def test_align_points_weights(xp):
+    dtype = xpx.default_dtype(xp)
+    atol = 1e-10 if dtype == xp.float64 else 1e-4
+    rng = np.random.default_rng(3)
+    b = rng.normal(size=(8, 3))
+    a = RigidTransform.from_components(
+        [1, -2, 3], Rotation.random(rng=rng)
+    ).apply(b) + 0.1 * rng.normal(size=(8, 3))
+    a[0] += 100.0  # outlier
+    a, b = xp.asarray(a, dtype=dtype), xp.asarray(b, dtype=dtype)
+    w = xp.asarray([0.0] + [1.0] * 7, dtype=dtype)
+
+    # A zero weight is the same as leaving the point out.
+    tf_w, rssd_w = RigidTransform.align_points(a, b, w)
+    tf_sub, rssd_sub = RigidTransform.align_points(a[1:, ...], b[1:, ...])
+    xp_assert_close(tf_w.as_matrix(), tf_sub.as_matrix(), atol=atol)
+    xp_assert_close(rssd_w, rssd_sub, atol=atol)
+
+    # Scaling all weights scales rssd by sqrt(scale) but not the transform.
+    tf_s, rssd_s = RigidTransform.align_points(a, b, 4 * w)
+    xp_assert_close(tf_s.as_matrix(), tf_w.as_matrix(), atol=atol)
+    xp_assert_close(rssd_s, 2 * rssd_w, rtol=1e-6 if atol < 1e-8 else 1e-3)
+
+
+@make_xp_test_case((RigidTransform, "align_points"), (RigidTransform, "apply"))
+def test_align_points_degenerate(xp):
+    dtype = xpx.default_dtype(xp)
+    atol = 1e-10 if dtype == xp.float64 else 1e-5
+
+    # A single pair only determines the translation.
+    a = xp.asarray([[1.0, 2.0, 3.0]], dtype=dtype)
+    b = xp.asarray([[-1.0, 0.0, 5.0]], dtype=dtype)
+    with pytest.warns(UserWarning, match="not uniquely"):
+        tf, rssd = RigidTransform.align_points(a, b)
+    xp_assert_close(tf.rotation.as_matrix(), xp.eye(3, dtype=dtype), atol=atol)
+    xp_assert_close(tf.translation, a[0, ...] - b[0, ...], atol=atol)
+    xp_assert_close(rssd, xp.asarray(0.0, dtype=dtype)[()])
+
+    # Collinear points leave the rotation about their line undetermined, but the
+    # points themselves are still aligned exactly.
+    b = xp.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=dtype)
+    tf_true = rigid_transform_to_xp(
+        RigidTransform.from_components(
+            [1, 2, 3], Rotation.from_rotvec([0.1, 0.2, 0.3])
+        ),
+        xp,
+    )
+    a = tf_true.apply(b)
+    # Only the Cython backend of Rotation.align_vectors warns here. The Array API
+    # backend computes the (unrequested) sensitivity matrix, which divides by zero
+    # for collinear vectors.
+    if is_numpy(xp):
+        with pytest.warns(UserWarning, match="not uniquely"):
+            tf, _ = RigidTransform.align_points(a, b)
+    else:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", "divide by zero", RuntimeWarning)
+            tf, _ = RigidTransform.align_points(a, b)
+    xp_assert_close(tf.apply(b), a, atol=atol * 1e3)
+
+
+@make_xp_test_case((RigidTransform, "align_points"))
+def test_align_points_invalid_input(xp):
+    a = xp.ones((4, 3))
+    with pytest.raises(ValueError, match="shape \\(N, 3\\)"):
+        RigidTransform.align_points(xp.ones((4, 2)), xp.ones((4, 2)))
+    with pytest.raises(ValueError, match="shape \\(N, 3\\)"):
+        RigidTransform.align_points(xp.ones(3), xp.ones(3))
+    with pytest.raises(ValueError, match="same shape"):
+        RigidTransform.align_points(a, xp.ones((5, 3)))
+    with pytest.raises(ValueError, match="at least one pair"):
+        RigidTransform.align_points(xp.ones((0, 3)), xp.ones((0, 3)))
+    with pytest.raises(ValueError, match="`weights` to have shape"):
+        RigidTransform.align_points(a, a, xp.ones(3))
+
+    bad_weights = [
+        ([1.0, 1.0, -1.0, 1.0], "negative"),
+        ([1.0, 1.0, xp.inf, 1.0], "finite"),
+        ([0.0, 0.0, 0.0, 0.0], "positive"),
+    ]
+    for w, match in bad_weights:
+        w = xp.asarray(w)
+        if is_lazy_array(w):
+            continue
+        with pytest.raises(ValueError, match=match):
+            RigidTransform.align_points(a, a, w)
+
+
+def test_align_points_array_like():
+    rng = np.random.default_rng(4)
+    b = rng.normal(size=(5, 3))
+    a = RigidTransform.from_components([1, 2, 3], Rotation.random(rng=rng)).apply(b)
+    tf_expected, rssd_expected = RigidTransform.align_points(a, b)
+    tf, rssd = RigidTransform.align_points(a.tolist(), b.tolist(), [1] * 5)
+    xp_assert_close(tf.as_matrix(), tf_expected.as_matrix())
+    xp_assert_close(rssd, rssd_expected)

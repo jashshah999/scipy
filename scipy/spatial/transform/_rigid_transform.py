@@ -3,11 +3,13 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from types import EllipsisType, GenericAlias, ModuleType
 from collections.abc import Callable
+import warnings
 
 import numpy as np
 
 from scipy._lib._array_api import (
     array_namespace,
+    is_lazy_array,
     is_numpy,
     ArrayLike,
     Array,
@@ -91,6 +93,12 @@ rigid_transform_extra_note = (
                 ("cupy", "missing .mT attribute in cupy<14.*"),
             ],
         ),
+        "align_points": dict(
+            skip_backends=[
+                ("dask.array", "missing linalg.cross/det functions and .mT attribute"),
+                ("cupy", "missing .mT attribute in cupy<14.*"),
+            ],
+        ),
     },
     extra_note=rigid_transform_extra_note,
 )
@@ -171,6 +179,7 @@ class RigidTransform:
     apply
     inv
     identity
+    align_points
 
     Notes
     -----
@@ -1030,6 +1039,154 @@ class RigidTransform:
             [xpx.atleast_nd(x.as_matrix(), ndim=3, xp=xp) for x in transforms]
         )
         return RigidTransform._from_raw_matrix(matrix, xp, None)
+
+    @staticmethod
+    def align_points(
+        a: ArrayLike, b: ArrayLike, weights: ArrayLike | None = None
+    ) -> tuple[RigidTransform, float | Array]:
+        """Estimate a rigid transform to optimally align two sets of points.
+
+        Find the rigid transform ``tf`` (a rotation followed by a translation)
+        which best maps the points `b` onto the corresponding points `a`, by
+        minimizing the weighted sum of squared distances:
+
+        .. math::
+
+            L(C, t) = \\frac{1}{2} \\sum_{i = 1}^{n} w_i \\lVert
+            \\mathbf{a}_i - (C \\mathbf{b}_i + t) \\rVert^2 ,
+
+        where :math:`w_i`'s are the `weights` corresponding to each pair of
+        points. This is known as the orthogonal (or partial) Procrustes
+        superimposition problem [1]_. For any rotation :math:`C`, the optimal
+        translation maps the weighted centroid of `b` onto the weighted centroid
+        of `a`, so the rotation is found by solving the Kabsch problem on the
+        centered points with `Rotation.align_vectors`, and the translation is
+        then :math:`t = \\bar{\\mathbf{a}} - C \\bar{\\mathbf{b}}`.
+
+        The rotation is only uniquely defined if the points (with non-zero
+        weight) are not all collinear. With fewer than three non-collinear
+        points a warning is raised and one of the optimal rotations is
+        returned; for a single pair of points this is the identity rotation.
+        Aligning with scaling as well (full Procrustes superimposition, the
+        Umeyama algorithm) is not supported, as scaling is not a rigid
+        transform.
+
+        Parameters
+        ----------
+        a : array_like, shape (N, 3)
+            Target points, observed in frame A. Each row of `a` is a point.
+        b : array_like, shape (N, 3)
+            Points observed in frame B, in the same order as `a`.
+        weights : array_like, shape (N,), optional
+            Weights describing the relative importance of the point pairs. If
+            None (default), then all values in `weights` are assumed to be 1.
+            Weights must be finite and non-negative, and at least one must be
+            positive.
+
+        Returns
+        -------
+        transform : `RigidTransform` instance
+            Best estimate of the transform ``tf`` such that ``tf.apply(b)``
+            is closest to `a`.
+        rssd : float
+            Stands for "root sum squared distance". Square root of the weighted
+            sum of the squared distances between `a` and the transformed `b`,
+            i.e. ``sqrt(2 * minimum_loss)``.
+
+        See Also
+        --------
+        Rotation.align_vectors
+
+        Notes
+        -----
+        This function does not support broadcasting or ND arrays with N > 2.
+
+        .. versionadded:: 2.0.0
+
+        References
+        ----------
+        .. [1] https://en.wikipedia.org/wiki/Procrustes_analysis
+        .. [2] https://en.wikipedia.org/wiki/Kabsch_algorithm
+
+        Examples
+        --------
+        >>> import numpy as np
+        >>> from scipy.spatial.transform import RigidTransform as Tf
+        >>> from scipy.spatial.transform import Rotation as R
+
+        Recover a known transform from noiseless points:
+
+        >>> rng = np.random.default_rng(seed=123)
+        >>> b = rng.normal(size=(5, 3))
+        >>> tf_true = Tf.from_components([1, 2, 3], R.from_rotvec([0, 0, np.pi / 2]))
+        >>> a = tf_true.apply(b)
+        >>> tf, rssd = Tf.align_points(a, b)
+        >>> np.allclose(tf.as_matrix(), tf_true.as_matrix())
+        True
+        >>> bool(rssd < 1e-6)
+        True
+
+        With noisy points, `rssd` is the residual after alignment. Down-weighting
+        an outlier reduces its influence on the estimate:
+
+        >>> a_noisy = a.copy()
+        >>> a_noisy[0] += [0, 0, 1]
+        >>> tf, rssd = Tf.align_points(a_noisy, b)
+        >>> float(rssd) > 0.5
+        True
+        >>> tf, rssd = Tf.align_points(a_noisy, b, weights=[0, 1, 1, 1, 1])
+        >>> np.allclose(tf.as_matrix(), tf_true.as_matrix())
+        True
+        """
+        xp = array_namespace(a, b, weights)
+        a, b, weights = _promote(a, b, weights, xp=xp)
+        if a.ndim != 2 or a.shape[-1] != 3:
+            raise ValueError(f"Expected `a` to have shape (N, 3), got {a.shape}.")
+        if b.shape != a.shape:
+            raise ValueError(
+                f"Expected `a` and `b` to have the same shape, got {a.shape} and "
+                f"{b.shape}."
+            )
+        n = a.shape[0]
+        if n == 0:
+            raise ValueError("Expected at least one pair of points.")
+
+        if weights is None:
+            weights = xp.ones(n, dtype=a.dtype, device=device(a))
+        else:
+            if weights.shape != (n,):
+                raise ValueError(
+                    f"Expected `weights` to have shape ({n},), got {weights.shape}."
+                )
+            # Value checks are only possible for eagerly evaluated arrays.
+            if not is_lazy_array(weights):
+                if not xp.all(xp.isfinite(weights)):
+                    raise ValueError("`weights` must be finite.")
+                if xp.any(weights < 0):
+                    raise ValueError("`weights` may not contain negative values.")
+                if not xp.any(weights > 0):
+                    raise ValueError("At least one of `weights` must be positive.")
+
+        w = weights / xp.sum(weights)
+        a_mean = xp.sum(w[:, None] * a, axis=0)
+        b_mean = xp.sum(w[:, None] * b, axis=0)
+
+        if n == 1:
+            warnings.warn(
+                "Optimal rotation is not uniquely or poorly defined for a single "
+                "pair of points; the identity rotation is returned.",
+                UserWarning,
+                stacklevel=2,
+            )
+            rotation = Rotation.from_quat(
+                xp.asarray([0.0, 0.0, 0.0, 1.0], dtype=a.dtype, device=device(a))
+            )
+            rssd = xp.asarray(0.0, dtype=a.dtype, device=device(a))[()]
+        else:
+            rotation, rssd = Rotation.align_vectors(a - a_mean, b - b_mean, weights)
+
+        translation = a_mean - rotation.apply(b_mean)
+        return RigidTransform.from_components(translation, rotation), rssd
 
     def mean(self,
         weights: ArrayLike | None = None,
